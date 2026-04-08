@@ -18,7 +18,7 @@
 /*
    global
 
-   DEFAULTVOLUME, TARGETBPM, TONEBPM, frequencyToPitch, last,
+   DEFAULTVOLUME, TARGETBPM, TONEBPM, MIN_HIGHLIGHT_DURATION_MS, deepClone, frequencyToPitch, last,
    pitchToFrequency, getNote, isCustomTemperament, getStepSizeUp,
    getStepSizeDown, numberToPitch, pitchToNumber, rationalSum,
    noteIsSolfege, getSolfege, SOLFEGENAMES1, SOLFEGECONVERSIONTABLE,
@@ -135,7 +135,9 @@ class Singer {
         this.instrumentNames = [];
         this.inCrescendo = [];
         this.crescendoDelta = [];
-        this.crescendoInitialVolume = { DEFAULTVOICE: [DEFAULTVOLUME] };
+        this.crescendoInitialVolume = {
+            DEFAULTVOICE: [typeof DEFAULTVOLUME !== "undefined" ? DEFAULTVOLUME : 50]
+        };
         this.intervals = []; // relative interval (based on scale degree)
         this.semitoneIntervals = []; // absolute interval (based on semitones)
         this.chordIntervals = []; // combination of scale degree and semitones
@@ -208,13 +210,51 @@ class Singer {
         this.dispatchFactor = 1; // scale factor for turtle graphics embedded in notes
 
         this.inverted = false; // tracks if the notes being played are inverted
+
+        // Voice Manager: Track active audio sources for proper cleanup
+        this.activeVoices = new Set();
+    }
+
+    /**
+     * Kills all active audio voices for this turtle.
+     * Called during stop/halt to prevent "zombie audio" that continues playing.
+     * Uses try/catch to handle nodes that may have already stopped.
+     *
+     * @returns {void}
+     */
+    killAllVoices() {
+        this.activeVoices.forEach(audioNode => {
+            try {
+                // Stop Tone.Player instances (drums/samples)
+                if (audioNode.stop && typeof audioNode.stop === "function") {
+                    audioNode.stop();
+                }
+                // Release all voices for PolySynth/Sampler instances
+                else if (audioNode.releaseAll && typeof audioNode.releaseAll === "function") {
+                    audioNode.releaseAll();
+                }
+                // Disconnect as fallback
+                else if (audioNode.disconnect && typeof audioNode.disconnect === "function") {
+                    audioNode.disconnect();
+                }
+            } catch (e) {
+                // Ignore errors from already-stopped nodes
+            }
+        });
+        this.activeVoices.clear();
     }
 
     // ========= Class variables ==============================================
     // Parameters used by notes
-    static masterBPM = TARGETBPM;
-    static defaultBPMFactor = TONEBPM / TARGETBPM;
-    static masterVolume = [DEFAULTVOLUME];
+    // Note: These globals (TARGETBPM, TONEBPM, DEFAULTVOLUME) are defined in logo.js.
+    // We use safe defaults here because this file may load before logo.js due to
+    // the RequireJS dependency chain.
+    static masterBPM = typeof TARGETBPM !== "undefined" ? TARGETBPM : 120;
+    static defaultBPMFactor =
+        typeof TONEBPM !== "undefined" && typeof TARGETBPM !== "undefined"
+            ? TONEBPM / TARGETBPM
+            : 1;
+    static masterVolume = [typeof DEFAULTVOLUME !== "undefined" ? DEFAULTVOLUME : 50];
 
     // ========= Deprecated ===================================================
 
@@ -474,9 +514,11 @@ class Singer {
         const saveSuppressStatus = tur.singer.suppressOutput;
 
         // We need to save the state of the boxes and heap although there is a potential of a boxes collision with other turtles
-        const saveBoxes = JSON.stringify(logo.boxes);
-        const saveTurtleHeaps = JSON.stringify(logo.turtleHeaps[turtle]);
-        const saveTurtleDicts = JSON.stringify(logo.turtleDicts[turtle]);
+        const saveBoxes = logo.boxes != null ? deepClone(logo.boxes) : undefined;
+        const saveTurtleHeaps =
+            logo.turtleHeaps[turtle] != null ? deepClone(logo.turtleHeaps[turtle]) : undefined;
+        const saveTurtleDicts =
+            logo.turtleDicts[turtle] != null ? deepClone(logo.turtleDicts[turtle]) : undefined;
         // .. and the turtle state
         const saveX = tur.x;
         const saveY = tur.y;
@@ -498,7 +540,7 @@ class Singer {
 
         for (const b in tur.endOfClampSignals) {
             tur.butNotThese[b] = [];
-            for (const i in tur.endOfClampSignals[b]) {
+            for (const i of tur.endOfClampSignals[b]) {
                 tur.butNotThese[b].push(i);
             }
         }
@@ -530,17 +572,17 @@ class Singer {
         if (saveBoxes == undefined) {
             logo.boxes = {};
         } else {
-            logo.boxes = JSON.parse(saveBoxes);
+            logo.boxes = saveBoxes;
         }
         if (saveTurtleHeaps == undefined) {
             logo.turtleHeaps = {};
         } else {
-            logo.turtleHeaps[turtle] = JSON.parse(saveTurtleHeaps);
+            logo.turtleHeaps[turtle] = saveTurtleHeaps;
         }
         if (saveTurtleDicts == undefined) {
             logo.turtleDicts = {};
         } else {
-            logo.turtleDicts[turtle] = JSON.parse(saveTurtleDicts);
+            logo.turtleDicts[turtle] = saveTurtleDicts;
         }
 
         tur.painter.doPenUp();
@@ -586,9 +628,11 @@ class Singer {
 
         const saveState = {
             suppressOutput: tur.singer.suppressOutput,
-            boxes: JSON.stringify(logo.boxes),
-            turtleHeaps: JSON.stringify(logo.turtleHeaps[turtle]),
-            turtleDicts: JSON.stringify(logo.turtleDicts[turtle]),
+            boxes: logo.boxes != null ? deepClone(logo.boxes) : undefined,
+            turtleHeaps:
+                logo.turtleHeaps[turtle] != null ? deepClone(logo.turtleHeaps[turtle]) : undefined,
+            turtleDicts:
+                logo.turtleDicts[turtle] != null ? deepClone(logo.turtleDicts[turtle]) : undefined,
             x: tur.x,
             y: tur.y,
             color: tur.painter.color,
@@ -645,25 +689,15 @@ class Singer {
             penState: saveState.penState
         });
 
-        activity.logo.boxes = JSON.parse(saveState.boxes);
-        activity.logo.turtleHeaps[turtle] = JSON.parse(saveState.turtleHeaps);
-        activity.logo.turtleDicts[turtle] = JSON.parse(saveState.turtleDicts);
+        activity.logo.boxes = saveState.boxes != null ? saveState.boxes : {};
+        activity.logo.turtleHeaps[turtle] =
+            saveState.turtleHeaps != null ? saveState.turtleHeaps : {};
+        activity.logo.turtleDicts[turtle] =
+            saveState.turtleDicts != null ? saveState.turtleDicts : {};
 
         tur.painter.doPenUp();
         tur.painter.doSetXY(saveState.x, saveState.y);
         tur.painter.doSetHeading(saveState.orientation);
-        tur.painter.doSetXY(saveX, saveY);
-        tur.painter.color = saveColor;
-        tur.painter.value = saveValue;
-        tur.painter.chroma = saveChroma;
-        tur.painter.stroke = saveStroke;
-        tur.painter.canvasAlpha = saveCanvasAlpha;
-        tur.painter.doSetHeading(saveOrientation);
-        tur.painter.penState = savePenState;
-        tur.singer.suppressOutput = saveSuppressStatus;
-        tur.singer.previousTurtleTime = savePrevTurtleTime;
-        tur.singer.turtleTime = saveTurtleTime;
-        tur.singer.whichNoteToCount = saveWhichNoteToCount;
         tur.singer.justCounting.pop();
         tur.butNotThese = {};
 
@@ -683,15 +717,23 @@ class Singer {
         const activity = logo.activity;
         volume = Math.min(Math.max(volume, 0), 100);
         if (blk) {
-            const firstConnection = activity.logo.blockList[blk].connections[0];
-            const lastConnection = last(activity.logo.blockList[blk].connections);
+            const firstConnection = activity.blocks.blockList[blk].connections[0];
+            const lastConnection = last(activity.blocks.blockList[blk].connections);
             logo.synth.setMasterVolume(volume, firstConnection, lastConnection);
         } else {
             logo.synth.setMasterVolume(volume);
         }
         for (const turtle of activity.turtles.turtleList) {
             for (const synth in turtle.singer.synthVolume) {
-                turtle.singer.synthVolume[synth].push(volume);
+                // Replace last value instead of pushing to prevent unbounded
+                // array growth. Master volume doesn't use stack semantics,
+                // so only the current volume matters.
+                const arr = turtle.singer.synthVolume[synth];
+                if (arr.length > 0) {
+                    arr[arr.length - 1] = volume;
+                } else {
+                    arr.push(volume);
+                }
             }
         }
     }
@@ -851,7 +893,9 @@ class Singer {
                     activity.errorMsg,
                     activity.logo.synth.inTemperament
                 );
-                nnote[0] = noteIsSolfege(note) ? getSolfege(nnote[0]) : nnote[0];
+                nnote[0] = noteIsSolfege(note)
+                    ? getSolfege(nnote[0], tur.singer.keySignature, tur.singer.movable)
+                    : nnote[0];
 
                 if (tur.singer.drumStyle.length > 0) {
                     activity.logo.pitchDrumMatrix.drums.push(last(tur.singer.drumStyle));
@@ -897,7 +941,11 @@ class Singer {
                     tur.singer.keySignature[1].toLowerCase() === "major" &&
                     noteIsSolfege(note)
                 ) {
-                    noteObj[0] = getSolfege(noteObj[0]);
+                    noteObj[0] = getSolfege(
+                        noteObj[0],
+                        tur.singer.keySignature,
+                        tur.singer.movable
+                    );
                 }
 
                 // If we are in a setdrum clamp, override the pitch.
@@ -960,7 +1008,11 @@ class Singer {
                     tur.singer.keySignature[1].toLowerCase() === "major" &&
                     noteIsSolfege(note)
                 ) {
-                    noteObj[0] = getSolfege(noteObj[0]);
+                    noteObj[0] = getSolfege(
+                        noteObj[0],
+                        tur.singer.keySignature,
+                        tur.singer.movable
+                    );
                 }
 
                 // If we are in a setdrum clamp, override the pitch.
@@ -1046,7 +1098,10 @@ class Singer {
                 // Cents may have been added through a transposition.
                 if (noteObj[2] !== 0 && cents === 0) {
                     cents = noteObj[2];
-                    // eslint-disable-next-line no-console
+                }
+
+                if (Math.abs(cents) < 1e-9) {
+                    cents = 0;
                 }
 
                 if (tur.singer.drumStyle.length > 0) {
@@ -1204,7 +1259,9 @@ class Singer {
                 null,
                 activity.errorMsg
             );
-            nnote[0] = noteIsSolfege(note) ? getSolfege(nnote[0]) : nnote[0];
+            nnote[0] = noteIsSolfege(note)
+                ? getSolfege(nnote[0], tur.singer.keySignature, tur.singer.movable)
+                : nnote[0];
 
             if (tur.singer.drumStyle.length === 0) {
                 activity.logo.musicKeyboard.instruments.push(last(tur.singer.instrumentNames));
@@ -1566,6 +1623,9 @@ class Singer {
             // We start the music clock as the first note is being played
             if (activity.logo.firstNoteTime === null) {
                 activity.logo.firstNoteTime = new Date().getTime();
+                if (typeof Tone !== "undefined") {
+                    activity.logo.firstNoteAudioTime = Tone.now();
+                }
             }
 
             // Calculate a lag: In case this turtle has fallen behind,
@@ -1819,6 +1879,15 @@ class Singer {
             if (duration > 0) {
                 tur.singer.previousTurtleTime = tur.singer.turtleTime;
                 if (tur.singer.inNoteBlock.length === 1) {
+                    if (
+                        !tur.singer.suppressOutput &&
+                        activity.logo.firstNoteAudioTime !== null &&
+                        typeof Tone !== "undefined"
+                    ) {
+                        const audioElapsed = Tone.now() - activity.logo.firstNoteAudioTime;
+                        future = Math.max(tur.singer.previousTurtleTime - audioElapsed, 0);
+                    }
+
                     tur.singer.turtleTime += bpmFactor / duration;
                     if (!tur.singer.suppressOutput) {
                         tur.doWait(Math.max(bpmFactor / duration - turtleLag, 0));
@@ -1837,7 +1906,6 @@ class Singer {
                             break;
                         }
                     }
-                    // eslint-disable-next-line no-console
                 }
             }
             let forceSilence = false;
@@ -2041,7 +2109,11 @@ class Singer {
                             let d;
                             if (duration > 0) {
                                 if (carry > 0) {
-                                    d = 1 / (1 / duration - 1 / carry);
+                                    if (Math.abs(duration - carry) < 1e-10) {
+                                        d = 0;
+                                    } else {
+                                        d = 1 / (1 / duration - 1 / carry);
+                                    }
                                 } else {
                                     d = duration;
                                 }
@@ -2096,8 +2168,10 @@ class Singer {
                                 pitchNumber *
                                 (Math.log10(ratio[k]) / Math.log10(getOctaveRatio()))
                             ).toFixed(0);
-                            numerator[k] = rationalToFraction(ratio[k])[0];
-                            denominator[k] = rationalToFraction(ratio[k])[1];
+                            // Cache rationalToFraction result to avoid duplicate calls
+                            const fraction = rationalToFraction(ratio[k]);
+                            numerator[k] = fraction[0];
+                            denominator[k] = fraction[1];
                         }
                     }
 
@@ -2433,12 +2507,26 @@ class Singer {
                 // After the note plays, clear the embedded graphics and notes queue.
                 tur.singer.embeddedGraphics[blk] = [];
 
-                // Ensure note value block unhighlights after note plays.
-                setTimeout(() => {
+                // Ensure note value block unhighlights after note plays (minimum duration so highlight is visible).
+                // Cancel any previously pending unhighlight timer for this block to
+                // prevent unbounded timer accumulation in tight infinite loops, which
+                // would otherwise saturate the JS timer queue and stall the main thread.
+                if (!tur.singer._unhighlightTimers) {
+                    tur.singer._unhighlightTimers = {};
+                }
+                if (tur.singer._unhighlightTimers[blk]) {
+                    clearTimeout(tur.singer._unhighlightTimers[blk]);
+                }
+                const highlightDurationMs = Math.max(beatValue * 1000, MIN_HIGHLIGHT_DURATION_MS);
+                tur.singer._unhighlightTimers[blk] = setTimeout(() => {
                     if (activity.blocks.visible && blk in activity.blocks.blockList) {
                         activity.blocks.unhighlight(blk);
+                        if (activity.stage) {
+                            activity.stage.update();
+                        }
                     }
-                }, beatValue * 1000);
+                    delete tur.singer._unhighlightTimers[blk];
+                }, highlightDurationMs);
             };
 
             if (last(tur.singer.inNoteBlock) !== null || noteInNote) {
@@ -2491,10 +2579,23 @@ class Singer {
             callback();
         }
 
-        activity.stage.update();
+        activity.stageDirty = true;
     }
 }
 
+// Maintain CommonJS compatibility for tests
 if (typeof module !== "undefined" && module.exports) {
     module.exports = Singer;
+}
+
+// Implement additive AMD define
+if (typeof define === "function" && define.amd) {
+    define(["activity/logoconstants"], function () {
+        return Singer;
+    });
+}
+
+// Preserve existing global exposure exactly as before
+if (typeof window !== "undefined") {
+    window.Singer = Singer;
 }
