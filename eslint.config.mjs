@@ -163,6 +163,7 @@ export default [
             "no-irregular-whitespace": "warn"
         }
     },
+<<<<<<< HEAD
 
     {
         files: ["**/__tests__/**/*.js", "**/*.test.js"],
@@ -208,4 +209,12 @@ export default [
             }
         }
     }
+=======
+    {
+        files: ['cypress/support/**/*.js'],
+        languageOptions: {
+            sourceType: 'module',
+        },
+    },
+>>>>>>> 6036c53c3 (chore: lint)
 ];
