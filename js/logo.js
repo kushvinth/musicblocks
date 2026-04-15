@@ -19,28 +19,20 @@
    VIDEOVALUE, last, getIntervalDirection, getIntervalNumber,
    mixedNumber, rationalToFraction, doStopVideoCam, StatusMatrix,
    getStatsFromNotation, delayExecution, DEFAULTVOICE, performanceTracker,
-   requirejs, window, define, DEFAULTVOLUME, PREVIEWVOLUME, DEFAULTDELAY,
+   requirejs, define, DEFAULTVOLUME, PREVIEWVOLUME, DEFAULTDELAY,
    OSCVOLUMEADJUSTMENT, TONEBPM, TARGETBPM, TURTLESTEP, NOTEDIV,
-   MIN_HIGHLIGHT_DURATION_MS, NOMICERRORMSG, NANERRORMSG, NOSTRINGERRORMSG,
-   NOBOXERRORMSG, NOACTIONERRORMSG, NOINPUTERRORMSG, NOSQRTERRORMSG,
-   ZERODIVIDEERRORMSG, EMPTYHEAPERRORMSG, POSNUMBER,
-   NOTATIONNOTE, NOTATIONDURATION, NOTATIONDOTCOUNT,
-   NOTATIONTUPLETVALUE, NOTATIONROUNDDOWN, NOTATIONINSIDECHORD,
-   NOTATIONSTACCATO
+   MIN_HIGHLIGHT_DURATION_MS,
+   NOMICERRORMSG, NANERRORMSG, NOSTRINGERRORMSG, NOBOXERRORMSG,
+   NOACTIONERRORMSG, NOINPUTERRORMSG, NOSQRTERRORMSG, ZERODIVIDEERRORMSG,
+   EMPTYHEAPERRORMSG, INVALIDPITCH, POSNUMBER, NOTATIONNOTE, NOTATIONDURATION,
+   NOTATIONDOTCOUNT, NOTATIONTUPLETVALUE, NOTATIONROUNDDOWN,
+   NOTATIONINSIDECHORD, NOTATIONSTACCATO, ManagedTimer
  */
 
 /*
    exported
 
-   DEFAULTVOLUME, PREVIEWVOLUME, DEFAULTDELAY,
-   OSCVOLUMEADJUSTMENT, TONEBPM, TARGETBPM, TURTLESTEP, NOTEDIV,
-   MIN_HIGHLIGHT_DURATION_MS,
-   NOMICERRORMSG, NANERRORMSG, NOSTRINGERRORMSG, NOBOXERRORMSG,
-   NOACTIONERRORMSG, NOINPUTERRORMSG, NOSQRTERRORMSG,
-   ZERODIVIDEERRORMSG, EMPTYHEAPERRORMSG, INVALIDPITCH, POSNUMBER,
-   NOTATIONNOTE, NOTATIONDURATION, NOTATIONDOTCOUNT,
-   NOTATIONTUPLETVALUE, NOTATIONROUNDDOWN, NOTATIONINSIDECHORD,
-   NOTATIONSTACCATO
+   Queue, Logo, LogoDependencies
  */
 
 // Constants moved to js/logoconstants.js to resolve circular dependency
@@ -348,6 +340,55 @@ class Logo {
         this.mic = null;
         this.volumeAnalyser = null;
         this.pitchAnalyser = null;
+
+        // Centralized timer management for zombie-timer prevention.
+        // All setTimeout/setInterval calls in the execution engine are routed
+        // through this manager, allowing doStopTurtles() to cancel every
+        // pending timer in one sweep. This fixes ghost turtle movements,
+        // phantom sounds, and stale block highlighting that occur when the
+        // user presses Stop while animations are in-flight.
+        if (typeof ManagedTimer !== "undefined") {
+            this._timerManager = new ManagedTimer();
+        } else {
+            // Node.js / Jest environment — require the module
+            try {
+                const { ManagedTimer: MT } = require("./utils/ManagedTimer");
+                this._timerManager = new MT();
+            } catch (e) {
+                // Fallback: create a minimal shim so the engine still works
+                this._timerManager = {
+                    _activeTimers: new Set(),
+                    _activeIntervals: new Set(),
+                    totalCreated: 0,
+                    totalCancelled: 0,
+                    totalFired: 0,
+                    totalSuppressed: 0,
+                    get activeCount() {
+                        return this._activeTimers.size + this._activeIntervals.size;
+                    },
+                    setTimeout(cb, delay) {
+                        return setTimeout(cb, delay);
+                    },
+                    setGuardedTimeout(cb, delay, guard) {
+                        return setTimeout(() => {
+                            if (!guard()) cb();
+                        }, delay);
+                    },
+                    clearAll() {
+                        return 0;
+                    },
+                    getStats() {
+                        return {
+                            active: 0,
+                            created: 0,
+                            cancelled: 0,
+                            fired: 0,
+                            suppressed: 0
+                        };
+                    }
+                };
+            }
+        }
     }
 
     // ========= Setters, Getters =================================================================
@@ -399,6 +440,14 @@ class Logo {
      */
     get notation() {
         return this._notation;
+    }
+
+    /**
+     * Access the managed timer instance for diagnostics or external cancellation.
+     * @returns {ManagedTimer} The timer manager used by the execution engine.
+     */
+    get timerManager() {
+        return this._timerManager;
     }
 
     // ========= Utilities ========================================================================
@@ -793,14 +842,15 @@ class Logo {
                 default:
                     // Is it a plugin?
                     if (blockName in logo.evalArgDict) {
-                        const pluginFn = logo.evalArgDict[blockName];
-                        if (typeof pluginFn === "function") {
-                            pluginFn(logo, turtle, blk, parentBlk, receivedArg, tur);
-                        } else {
-                            logo.activity.errorMsg(
-                                _("Plugin failed to load: %s").replace(/%s/g, blockName)
-                            );
-                        }
+                        this.safePluginExecute(
+                            logo.evalArgDict[blockName],
+                            logo,
+                            turtle,
+                            blk,
+                            parentBlk,
+                            receivedArg,
+                            tur
+                        );
                     } else {
                         console.error("I do not know how to " + blockName);
                     }
@@ -1034,6 +1084,18 @@ class Logo {
         this.stopTurtle = true;
         this.activity.turtles.markAllAsStopped();
 
+        // Cancel ALL pending managed timers to prevent zombie turtle graphics,
+        // phantom sounds, and stale block highlighting. This is the primary
+        // mechanism for the zombie-timer fix — every setTimeout dispatched by
+        // dispatchTurtleSignals, runFromBlock, and runFromBlockNow is tracked
+        // by _timerManager, so clearAll() cancels them in one sweep.
+        const cancelledTimers = this._timerManager.clearAll();
+        if (cancelledTimers > 0) {
+            console.debug(
+                "ManagedTimer: cancelled " + cancelledTimers + " pending timer(s) on stop"
+            );
+        }
+
         for (const sound in this.sounds) {
             this.sounds[sound].stop();
         }
@@ -1175,10 +1237,7 @@ class Logo {
         this.activity.saveLocally(); // Save the state before running.
 
         for (const arg in this.evalOnStartList) {
-            const pluginFn = this.evalOnStartList[arg];
-            if (typeof pluginFn === "function") {
-                pluginFn(this);
-            }
+            this.safePluginExecute(this.evalOnStartList[arg], this);
         }
 
         this.stopTurtle = false;
@@ -1411,31 +1470,39 @@ class Logo {
                 }
             }
 
-            setTimeout(() => {
-                if (delayStart !== 0) {
-                    // Launching status/oscilloscope block would have hidden the
-                    // Stop Button so show it again.
-                    this.onRunTurtle();
-                }
+            this._timerManager.setGuardedTimeout(
+                () => {
+                    if (delayStart !== 0) {
+                        // Launching status/oscilloscope block would have hidden the
+                        // Stop Button so show it again.
+                        this.onRunTurtle();
+                    }
 
-                // If there are multiple start blocks, run them all.
-                for (let b = 0; b < startBlocksLength; b++) {
-                    if (!["status", "oscilloscope"].includes(this.blockList[startBlocks[b]].name)) {
-                        const turtle = this.blockList[startBlocks[b]].value;
-                        const tur = this.activity.turtles.ithTurtle(turtle);
+                    // If there are multiple start blocks, run them all.
+                    for (let b = 0; b < startBlocksLength; b++) {
+                        if (
+                            !["status", "oscilloscope"].includes(
+                                this.blockList[startBlocks[b]].name
+                            )
+                        ) {
+                            const turtle = this.blockList[startBlocks[b]].value;
+                            const tur = this.activity.turtles.ithTurtle(turtle);
 
-                        tur.queue = [];
-                        tur.parentFlowQueue = [];
-                        tur.unhighlightQueue = [];
-                        tur.parameterQueue = [];
+                            tur.queue = [];
+                            tur.parentFlowQueue = [];
+                            tur.unhighlightQueue = [];
+                            tur.parameterQueue = [];
 
-                        if (!tur.inTrash) {
-                            tur.running = true;
-                            this.runFromBlock(this, turtle, startBlocks[b], 0, env);
+                            if (!tur.inTrash) {
+                                tur.running = true;
+                                this.runFromBlock(this, turtle, startBlocks[b], 0, env);
+                            }
                         }
                     }
-                }
-            }, delayStart);
+                },
+                delayStart,
+                () => this.stopTurtle
+            );
         } else {
             document.body.style.cursor = "default";
         }
@@ -1477,9 +1544,10 @@ class Logo {
                 logo.stepQueue[turtle].push(blk);
             } else {
                 tur.delayParameters = { blk: blk, flow: isflow, arg: receivedArg };
-                tur.delayTimeout = setTimeout(
+                tur.delayTimeout = logo._timerManager.setGuardedTimeout(
                     () => logo.runFromBlockNow(logo, turtle, blk, isflow, receivedArg),
-                    delay
+                    delay,
+                    () => logo.stopTurtle
                 );
             }
         }
@@ -1642,7 +1710,7 @@ class Logo {
                 logo._currentlyHighlightedBlock = blk;
                 // Force stage update so highlight is visible when blocks were shown during execution
                 if (logo.activity.stage) {
-                    logo.activity.stage.update();
+                    logo.activity.stageDirty = true;
                 }
             }
         }
@@ -1653,10 +1721,16 @@ class Logo {
             // Is it a plugin?
             if (currentBlock.name in logo.evalFlowDict) {
                 logo.pluginReturnValue = null;
-                const pluginFn = logo.evalFlowDict[currentBlock.name];
-                if (typeof pluginFn === "function") {
-                    pluginFn(logo, turtle, blk, receivedArg, actionArgs, args, isflow);
-                }
+                logo.safePluginExecute(
+                    logo.evalFlowDict[currentBlock.name],
+                    logo,
+                    turtle,
+                    blk,
+                    receivedArg,
+                    actionArgs,
+                    args,
+                    isflow
+                );
                 // Clamp blocks will return the child flow.
                 res = logo.pluginReturnValue;
             } else {
@@ -1789,22 +1863,22 @@ class Logo {
                     logo._unhighlightStepQueue[turtle] = blk;
                 } else {
                     if (!tur.singer.suppressOutput && tur.singer.justCounting.length === 0) {
-                        const unhighlightDelay = Math.max(
-                            logo.turtleDelay + tur.waitTime,
-                            MIN_HIGHLIGHT_DURATION_MS
+                        logo._timerManager.setGuardedTimeout(
+                            () => {
+                                if (logo.activity.blocks.visible) {
+                                    logo.activity.blocks.unhighlight(blk);
+                                    // Clear the currently highlighted block if it was this one
+                                    if (logo._currentlyHighlightedBlock === blk) {
+                                        logo._currentlyHighlightedBlock = null;
+                                    }
+                                    if (logo.activity.stage) {
+                                        logo.activity.stageDirty = true;
+                                    }
+                                }
+                            },
+                            Math.max(logo.turtleDelay + tur.waitTime, MIN_HIGHLIGHT_DURATION_MS),
+                            () => logo.stopTurtle
                         );
-                        setTimeout(() => {
-                            if (logo.activity.blocks.visible) {
-                                logo.activity.blocks.unhighlight(blk);
-                                // Clear the currently highlighted block if it was this one
-                                if (logo._currentlyHighlightedBlock === blk) {
-                                    logo._currentlyHighlightedBlock = null;
-                                }
-                                if (logo.activity.stage) {
-                                    logo.activity.stage.update();
-                                }
-                            }
-                        }, unhighlightDelay);
                     }
                 }
             }
@@ -1829,37 +1903,43 @@ class Logo {
                         tur.unhighlightQueue.push(logo.deps.utils.last(tur.parentFlowQueue));
                     } else if (tur.unhighlightQueue.length > 0) {
                         // The child flow is finally complete, so unhighlight.
-                        const unhighlightDelay = Math.max(
-                            logo.turtleDelay,
-                            MIN_HIGHLIGHT_DURATION_MS
+                        logo._timerManager.setGuardedTimeout(
+                            () => {
+                                if (logo.activity.blocks.visible) {
+                                    const unhighlightBlock = tur.unhighlightQueue.pop();
+                                    logo.activity.blocks.unhighlight(unhighlightBlock);
+                                    // Clear the currently highlighted block if it was this one
+                                    if (logo._currentlyHighlightedBlock === unhighlightBlock) {
+                                        logo._currentlyHighlightedBlock = null;
+                                    }
+                                    if (logo.activity.stage) {
+                                        logo.activity.stageDirty = true;
+                                    }
+                                } else {
+                                    tur.unhighlightQueue.pop();
+                                }
+                            },
+                            Math.max(logo.turtleDelay, MIN_HIGHLIGHT_DURATION_MS),
+                            () => logo.stopTurtle
                         );
-                        setTimeout(() => {
-                            if (logo.activity.blocks.visible) {
-                                const unhighlightBlock = tur.unhighlightQueue.pop();
-                                logo.activity.blocks.unhighlight(unhighlightBlock);
-                                // Clear the currently highlighted block if it was this one
-                                if (logo._currentlyHighlightedBlock === unhighlightBlock) {
-                                    logo._currentlyHighlightedBlock = null;
-                                }
-                                if (logo.activity.stage) {
-                                    logo.activity.stage.update();
-                                }
-                            } else {
-                                tur.unhighlightQueue.pop();
-                            }
-                        }, unhighlightDelay);
                     }
                 }
             }
 
             // We don't update parameter blocks when running full speed.
             if (logo.turtleDelay !== 0) {
+                let updatedParameterBlocks = false;
                 for (const pblk in tur.parameterQueue) {
                     logo.activity.blocks.updateParameterBlock(
                         logo,
                         turtle,
                         tur.parameterQueue[pblk]
                     );
+                    updatedParameterBlocks = true;
+                }
+
+                if (updatedParameterBlocks) {
+                    logo.activity.refreshCanvas();
                 }
             }
 
@@ -2020,7 +2100,7 @@ class Logo {
                     //         " " +
                     //         tur.singer.suppressOutput
                     // );
-                    logo._lastNoteTimeout = setTimeout(() => {
+                    logo._lastNoteTimeout = logo._timerManager.setTimeout(() => {
                         // console.debug("LAST NOTE PLAYED");
                         logo._lastNoteTimeout = null;
                         tur.singer.runningFromEvent = false;
@@ -2031,7 +2111,7 @@ class Logo {
                 }
             };
 
-            setTimeout(__checkCompletionState, 100);
+            logo._timerManager.setTimeout(__checkCompletionState, 100);
         }
 
         if (typeof performanceTracker !== "undefined") {
@@ -2119,7 +2199,11 @@ class Logo {
             if (suppressOutput) {
                 _penSwitch(name);
             } else {
-                setTimeout(() => _penSwitch(name), timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => _penSwitch(name),
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2153,7 +2237,11 @@ class Logo {
                 for (let t = 0; t < NOTEDIV / tur.singer.dispatchFactor; t++) {
                     const deltaTime = waitTime + t * stepTime * tur.singer.dispatchFactor;
                     const deltaArg = arg / (NOTEDIV / tur.singer.dispatchFactor);
-                    setTimeout(() => tur.painter.doRight(deltaArg), deltaTime);
+                    this._timerManager.setGuardedTimeout(
+                        () => tur.painter.doRight(deltaArg),
+                        deltaTime,
+                        () => this.stopTurtle
+                    );
                 }
             }
         };
@@ -2169,16 +2257,20 @@ class Logo {
                 );
                 tur.painter.doSetHeading(arg);
             } else {
-                setTimeout(() => {
-                    const arg = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[1],
-                        b,
-                        this.receivedArg
-                    );
-                    tur.painter.doSetHeading(arg);
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        const arg = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[1],
+                            b,
+                            this.receivedArg
+                        );
+                        tur.painter.doSetHeading(arg);
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2196,11 +2288,23 @@ class Logo {
                     const deltaTime = waitTime + t * stepTime * tur.singer.dispatchFactor;
                     const deltaArg = arg / (NOTEDIV / tur.singer.dispatchFactor);
                     if (t === 0) {
-                        setTimeout(() => tur.painter.doForward(deltaArg, "first"), deltaTime);
+                        this._timerManager.setGuardedTimeout(
+                            () => tur.painter.doForward(deltaArg, "first"),
+                            deltaTime,
+                            () => this.stopTurtle
+                        );
                     } else if (t === Math.ceil(NOTEDIV / tur.singer.dispatchFactor) - 1) {
-                        setTimeout(() => tur.painter.doForward(deltaArg, "last"), deltaTime);
+                        this._timerManager.setGuardedTimeout(
+                            () => tur.painter.doForward(deltaArg, "last"),
+                            deltaTime,
+                            () => this.stopTurtle
+                        );
                     } else {
-                        setTimeout(() => tur.painter.doForward(deltaArg, "middle"), deltaTime);
+                        this._timerManager.setGuardedTimeout(
+                            () => tur.painter.doForward(deltaArg, "middle"),
+                            deltaTime,
+                            () => this.stopTurtle
+                        );
                     }
                 }
             }
@@ -2224,23 +2328,27 @@ class Logo {
                 );
                 tur.painter.doScrollXY(arg1, arg2);
             } else {
-                setTimeout(() => {
-                    const arg1 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[1],
-                        b,
-                        this.receivedArg
-                    );
-                    const arg2 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[2],
-                        b,
-                        this.receivedArg
-                    );
-                    tur.painter.doScrollXY(arg1, arg2);
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        const arg1 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[1],
+                            b,
+                            this.receivedArg
+                        );
+                        const arg2 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[2],
+                            b,
+                            this.receivedArg
+                        );
+                        tur.painter.doScrollXY(arg1, arg2);
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2265,23 +2373,27 @@ class Logo {
                 tur.painter.doSetXY(arg1, arg2);
                 tur.painter.penState = savedPenState;
             } else {
-                setTimeout(() => {
-                    const arg1 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[1],
-                        b,
-                        this.receivedArg
-                    );
-                    const arg2 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[2],
-                        b,
-                        this.receivedArg
-                    );
-                    tur.painter.doSetXY(arg1, arg2);
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        const arg1 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[1],
+                            b,
+                            this.receivedArg
+                        );
+                        const arg2 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[2],
+                            b,
+                            this.receivedArg
+                        );
+                        tur.painter.doSetXY(arg1, arg2);
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2301,7 +2413,11 @@ class Logo {
                 b,
                 this.receivedArg
             );
-            setTimeout(() => this.processShow(turtle, null, arg1, arg2), timeout);
+            this._timerManager.setGuardedTimeout(
+                () => this.processShow(turtle, null, arg1, arg2),
+                timeout,
+                () => this.stopTurtle
+            );
         };
 
         const __speak = (turtle, b, timeout) => {
@@ -2313,7 +2429,11 @@ class Logo {
                 b,
                 this.receivedArg
             );
-            setTimeout(() => this.processSpeak(arg), timeout);
+            this._timerManager.setGuardedTimeout(
+                () => this.processSpeak(arg),
+                timeout,
+                () => this.stopTurtle
+            );
         };
 
         const __print = (turtle, b, timeout) => {
@@ -2326,7 +2446,11 @@ class Logo {
                 this.receivedArg
             );
             if (arg === undefined) return;
-            setTimeout(() => this.activity.textMsg(arg.toString()), timeout);
+            this._timerManager.setGuardedTimeout(
+                () => this.activity.textMsg(arg.toString()),
+                timeout,
+                () => this.stopTurtle
+            );
         };
 
         const __arc = (turtle, b, waitTime, stepTime) => {
@@ -2353,7 +2477,11 @@ class Logo {
                 for (let t = 0; t < NOTEDIV / tur.singer.dispatchFactor; t++) {
                     const deltaTime = waitTime + t * stepTime * tur.singer.dispatchFactor;
                     const deltaArg = arg1 / (NOTEDIV / tur.singer.dispatchFactor);
-                    setTimeout(() => tur.painter.doArc(deltaArg, arg2), deltaTime);
+                    this._timerManager.setGuardedTimeout(
+                        () => tur.painter.doArc(deltaArg, arg2),
+                        deltaTime,
+                        () => this.stopTurtle
+                    );
                 }
             }
         };
@@ -2377,24 +2505,28 @@ class Logo {
                 tur.painter.cp1x = arg1;
                 tur.painter.cp1y = arg2;
             } else {
-                setTimeout(() => {
-                    const arg1 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[1],
-                        b,
-                        this.receivedArg
-                    );
-                    const arg2 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[2],
-                        b,
-                        this.receivedArg
-                    );
-                    tur.painter.cp1x = arg1;
-                    tur.painter.cp1y = arg2;
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        const arg1 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[1],
+                            b,
+                            this.receivedArg
+                        );
+                        const arg2 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[2],
+                            b,
+                            this.receivedArg
+                        );
+                        tur.painter.cp1x = arg1;
+                        tur.painter.cp1y = arg2;
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2417,24 +2549,28 @@ class Logo {
                 tur.painter.cp2x = arg1;
                 tur.painter.cp2y = arg2;
             } else {
-                setTimeout(() => {
-                    const arg1 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[1],
-                        b,
-                        this.receivedArg
-                    );
-                    const arg2 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[2],
-                        b,
-                        this.receivedArg
-                    );
-                    tur.painter.cp2x = arg1;
-                    tur.painter.cp2y = arg2;
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        const arg1 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[1],
+                            b,
+                            this.receivedArg
+                        );
+                        const arg2 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[2],
+                            b,
+                            this.receivedArg
+                        );
+                        tur.painter.cp2x = arg1;
+                        tur.painter.cp2y = arg2;
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2459,23 +2595,27 @@ class Logo {
                 tur.painter.doBezier(arg1, arg2);
                 tur.painter.penState = savedPenState;
             } else {
-                setTimeout(() => {
-                    const arg1 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[1],
-                        b,
-                        this.receivedArg
-                    );
-                    const arg2 = this.parseArg(
-                        this,
-                        turtle,
-                        this.blockList[b].connections[2],
-                        b,
-                        this.receivedArg
-                    );
-                    tur.painter.doBezier(arg1, arg2);
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        const arg1 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[1],
+                            b,
+                            this.receivedArg
+                        );
+                        const arg2 = this.parseArg(
+                            this,
+                            turtle,
+                            this.blockList[b].connections[2],
+                            b,
+                            this.receivedArg
+                        );
+                        tur.painter.doBezier(arg1, arg2);
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2493,15 +2633,19 @@ class Logo {
                 }
                 tur.painter.penState = savedPenState;
             } else {
-                setTimeout(() => {
-                    if (inFillClamp) {
-                        tur.painter.doEndFill();
-                        inFillClamp = false;
-                    } else {
-                        tur.painter.doStartFill();
-                        inFillClamp = true;
-                    }
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        if (inFillClamp) {
+                            tur.painter.doEndFill();
+                            inFillClamp = false;
+                        } else {
+                            tur.painter.doStartFill();
+                            inFillClamp = true;
+                        }
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2516,15 +2660,19 @@ class Logo {
                     inHollowLineClamp = true;
                 }
             } else {
-                setTimeout(() => {
-                    if (inHollowLineClamp) {
-                        tur.painter.doEndHollowLine();
-                        inHollowLineClamp = false;
-                    } else {
-                        tur.painter.doStartHollowLine();
-                        inHollowLineClamp = true;
-                    }
-                }, timeout);
+                this._timerManager.setGuardedTimeout(
+                    () => {
+                        if (inHollowLineClamp) {
+                            tur.painter.doEndHollowLine();
+                            inHollowLineClamp = false;
+                        } else {
+                            tur.painter.doStartHollowLine();
+                            inHollowLineClamp = true;
+                        }
+                    },
+                    timeout,
+                    () => this.stopTurtle
+                );
             }
         };
 
@@ -2680,6 +2828,92 @@ class Logo {
         await this.deps.utils.delayExecution(beatValue * 1000);
         tur.embeddedGraphicsFinished = true;
     }
+
+    /**
+     * Executes plugin code safely.
+     * @param code - The plugin code (function or string) to execute.
+     * @param logo - The logo object.
+     * @param turtle - The turtle index.
+     * @param blk - The block index.
+     * @param value - An optional value for setters or additional context.
+     * @param args - Additional arguments for different plugin types.
+     * @returns {*} - The result of the execution if applicable.
+     */
+    safePluginExecute(code, logo, turtle, blk, value, ...args) {
+        if (typeof code === "function") {
+            try {
+                return code(logo, turtle, blk, value, ...args);
+            } catch (e) {
+                console.error("Plugin function execution failed: ", e);
+                return;
+            }
+        }
+
+        if (typeof code !== "string") {
+            return;
+        }
+
+        // Whitelist for common, safe math patterns used by plugins (e.g. maths.json)
+        // These are checked against the exact string format used in built-in plugins.
+        const mathPatterns = [
+            {
+                // Unary Math operations (Math.sin, etc.)
+                regex: /^const mathBlock = globalActivity\.logo\.blockList\[blk\];const conns = mathBlock\.connections;mathBlock\.value = Math\.(sin|cos|tan|asin|acos|atan|sqrt|log|exp|abs|ceil|floor|round)\(logo\.parseArg\(logo, turtle, conns\[1\]\)\);$/,
+                exec: match => {
+                    const op = match[1];
+                    const mathBlock = logo.blockList[blk];
+                    const conns = mathBlock.connections;
+                    mathBlock.value = Math[op](logo.parseArg(logo, turtle, conns[1], blk));
+                    return mathBlock.value;
+                }
+            },
+            {
+                // Binary Math operations (Math.pow)
+                regex: /^const mathBlock = globalActivity\.logo\.blockList\[blk\];const conns = mathBlock\.connections;var base = logo\.parseArg\(logo, turtle, conns\[1\]\);var exp {2}= logo\.parseArg\(logo, turtle, conns\[2\]\);mathBlock\.value = Math\.pow\(base, exp\);$/,
+                exec: () => {
+                    const mathBlock = logo.blockList[blk];
+                    const conns = mathBlock.connections;
+                    const base = logo.parseArg(logo, turtle, conns[1], blk);
+                    const exp = logo.parseArg(logo, turtle, conns[2], blk);
+                    mathBlock.value = Math.pow(base, exp);
+                    return mathBlock.value;
+                }
+            },
+            {
+                // Math Constants (Math.PI, Math.E)
+                regex: /^const mathBlock = globalActivity\.logo\.blockList\[blk\];const conns = mathBlock\.connections;mathBlock\.value = Math\.(PI|E);$/,
+                exec: match => {
+                    const constName = match[1];
+                    const mathBlock = logo.blockList[blk];
+                    mathBlock.value = Math[constName];
+                    return mathBlock.value;
+                }
+            },
+            {
+                // Parameter plugin patterns (simple assignment)
+                regex: /^logo\.blockList\[blk\]\.value = Math\.(PI|E);$/,
+                exec: match => {
+                    const constName = match[1];
+                    logo.blockList[blk].value = Math[constName];
+                    return logo.blockList[blk].value;
+                }
+            }
+        ];
+
+        for (const pattern of mathPatterns) {
+            const match = code.match(pattern.regex);
+            if (match) {
+                return pattern.exec(match);
+            }
+        }
+
+        // If not a function and not whitelisted, we block arbitrary string execution (eval).
+        // This is the core of the security fix for #5449.
+        console.warn(
+            "Blocked arbitrary JavaScript execution in plugin:",
+            code.substring(0, 100) + "..."
+        );
+    }
 }
 
 // Export Logo
@@ -2696,7 +2930,6 @@ if (typeof module !== "undefined" && module.exports) {
     if (typeof DEFAULTVOLUME === "undefined") {
         try {
             const constants = require("./logoconstants");
-            Object.assign(global, constants);
             Object.assign(exportsObj, constants);
         } catch (e) {
             // Ignore

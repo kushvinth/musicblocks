@@ -707,9 +707,9 @@
     "kanji": "音量を「0」にせっていします。",
     "kana": "おんりょうを 「0」に せってい します。"
   },
-  "electronic synth": {
-    "kanji": "シンセサイザー",
-    "kana": "シンセサイザー"
+  "Report projects which violate the <a href=\\\\\"https://github.com/sugarlabs/sugar-docs/blob/master/CODE_OF_CONDUCT.md\\\\\" target=\\\\\"_blank\\\\\" rel=\\\\\"noopener noreferrer\\\\\">Sugar Labs Code of Conduct</a>.": {
+    "kanji": "<a href=\\\\\"https://github.com/sugarlabs/sugar-docs/blob/master/CODE_OF_CONDUCT.md\\\\\" target=\\\\\"_blank\\\\\" rel=\\\\\"noopener noreferrer\\\\\">シュガー・ラボ ",
+    "kana": "<a href=\\\\\"https://github.com/sugarlabs/sugar-docs/blob/master/CODE_OF_CONDUCT.md\\\\\" target=\\\\\"_blank\\\\\" rel=\\\\\"noopener noreferrer\\\\\">シュガー・ラボ "
   },
   "solfege syllable": {
     "kanji": "階名（ド、レ、ミ）",
